@@ -39,6 +39,7 @@ except ImportError:
 
 # config
 api_key = None
+timeout = 60
 api_base = 'https://api.easypost.com/v2'
 
 
@@ -314,7 +315,7 @@ class Requestor(object):
                 abs_url,
                 headers=headers,
                 data=data,
-                timeout=60,
+                timeout=timeout,
                 verify=True,
             )
             http_body = result.text
