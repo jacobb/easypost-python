@@ -322,7 +322,8 @@ class Requestor(object):
             http_status = result.status_code
         except requests.Timeout:
             raise Error("Easypost request timed out")
-        except Exception:
+        except Exception as e:
+            print(e)
             raise Error("Unexpected error communicating with EasyPost. If this "
                         "problem persists please let us know at contact@easypost.com.")
         return http_body, http_status
