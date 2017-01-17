@@ -320,7 +320,8 @@ class Requestor(object):
             )
             http_body = result.text
             http_status = result.status_code
-        except requests.Timeout:
+        except requests.Timeout as e:
+            print(e)
             raise Error("Easypost request timed out")
         except Exception as e:
             print(e)
