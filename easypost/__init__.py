@@ -320,13 +320,13 @@ class Requestor(object):
             )
             http_body = result.text
             http_status = result.status_code
-        except requests.Timeout as e:
-            print(e)
-            raise Error("Easypost request timed out")
         except Exception as e:
-            print(e)
-            raise Error("Unexpected error communicating with EasyPost. If this "
-                        "problem persists please let us know at contact@easypost.com.")
+            raise Error("""
+                Unexpected error communicating with EasyPost: {}
+                If this
+                problem persists please let us know at contact@easypost.com"
+                """.format(e.message)
+            )
         return http_body, http_status
 
     def urlfetch_request(self, method, abs_url, headers, params):
