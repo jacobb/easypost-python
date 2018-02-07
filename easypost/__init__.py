@@ -1,19 +1,30 @@
-import six
+import datetime
 import json
 import platform
-import time
-import datetime
-import types
 import re
+import six
+import ssl
+import time
+import types
+
 from six.moves.urllib.parse import urlencode, quote_plus, urlparse
+
 from .version import VERSION
+
+__author__ = 'EasyPost <oss@easypost.com>'
+__version__ = VERSION
+version_info = tuple(int(v) for v in VERSION.split('.'))
 
 
 # use urlfetch as request_lib on google app engine, otherwise use requests
 request_lib = None
+# use a max timeout equal to that of all customer-facing backend operations
+_max_timeout = 90
 try:
     from google.appengine.api import urlfetch
     request_lib = 'urlfetch'
+    # use the GAE application-wide "deadline" (or its default) if it's less than our existing max timeout
+    _max_timeout = min(urlfetch.get_default_fetch_deadline() or 60, _max_timeout)
 except ImportError:
     try:
         import requests
@@ -41,11 +52,17 @@ except ImportError:
 api_key = None
 timeout = 60
 api_base = 'https://api.easypost.com/v2'
+# use our default timeout, or our max timeout if that is less
+timeout = min(60, _max_timeout)
+
+
+USER_AGENT = 'EasyPost/v2 PythonClient/{0}'.format(VERSION)
 
 
 class Error(Exception):
     def __init__(self, message=None, http_status=None, http_body=None):
         super(Error, self).__init__(message)
+        self.message = message
         self.http_status = http_status
         self.http_body = http_body
         try:
@@ -83,7 +100,8 @@ def convert_to_easypost_object(response, api_key, parent=None, name=None):
         'Report': Report,
         'ShipmentReport': Report,
         'PaymentLogReport': Report,
-        'TrackerReport': Report
+        'TrackerReport': Report,
+        'Webhook': Webhook
     }
 
     prefixes = {
@@ -107,7 +125,8 @@ def convert_to_easypost_object(response, api_key, parent=None, name=None):
         'user': User,
         'shprep': Report,
         'plrep': Report,
-        'trkrep': Report
+        'trkrep': Report,
+        'hook': Webhook
     }
 
     if isinstance(response, list):
@@ -129,7 +148,7 @@ def convert_to_easypost_object(response, api_key, parent=None, name=None):
 
 class Requestor(object):
     def __init__(self, local_api_key=None):
-        self.api_key = local_api_key
+        self._api_key = local_api_key
 
     @classmethod
     def api_url(cls, url=None):
@@ -154,7 +173,7 @@ class Requestor(object):
     @classmethod
     def encode_dict(cls, out, key, dict_value):
         n = {}
-        for k, v in six.iteritems(dict_value):
+        for k, v in sorted(six.iteritems(dict_value)):
             k = cls._utf8(k)
             v = cls._utf8(v)
             n["%s[%s]" % (key, k)] = v
@@ -191,7 +210,7 @@ class Requestor(object):
             ENCODERS[type(None)] = cls.encode_none
 
         out = []
-        for key, value in six.iteritems(params):
+        for key, value in sorted(six.iteritems(params)):
             key = cls._utf8(key)
             try:
                 encoder = ENCODERS[value.__class__]
@@ -245,7 +264,7 @@ class Requestor(object):
     def request_raw(self, method, url, params=None, apiKeyRequired=True):
         if params is None:
             params = {}
-        my_api_key = self.api_key or api_key
+        my_api_key = self._api_key or api_key
 
         if apiKeyRequired and my_api_key is None:
             raise Error(
@@ -262,21 +281,27 @@ class Requestor(object):
             'publisher': 'easypost',
             'request_lib': request_lib,
         }
-        for attr, func in [['lang_version', platform.python_version],
-                           ['platform', platform.platform],
-                           ['uname', lambda: ' '.join(platform.uname())]]:
+        for attr, func in (('lang_version', platform.python_version),
+                           ('platform', platform.platform),
+                           ('uname', lambda: ' '.join(platform.uname()))):
             try:
                 val = func()
             except Exception as e:
                 val = "!! %s" % e
             ua[attr] = val
 
+        if hasattr(ssl, 'OPENSSL_VERSION'):
+            ua['openssl_version'] = ssl.OPENSSL_VERSION
+
         headers = {
-            'X-EasyPost-Client-User-Agent': json.dumps(ua),
-            'User-Agent': 'EasyPost/v2 PythonClient/%s' % VERSION,
+            'X-Client-User-Agent': json.dumps(ua),
+            'User-Agent': USER_AGENT,
             'Authorization': 'Bearer %s' % my_api_key,
             'Content-type': 'application/x-www-form-urlencoded'
         }
+
+        if timeout > _max_timeout:
+            raise Error("`timeout` must not exceed %d; it is %d" % (_max_timeout, timeout))
 
         if request_lib == 'urlfetch':
             http_body, http_status = self.urlfetch_request(method, abs_url, headers, params)
@@ -343,7 +368,7 @@ class Requestor(object):
         args['method'] = method
         args['headers'] = headers
         args['validate_certificate'] = False
-        args['deadline'] = 55  # GAE times out after 60
+        args['deadline'] = timeout
 
         try:
             result = urlfetch.fetch(**args)
@@ -371,13 +396,13 @@ class EasyPostObject(object):
         self.__dict__['_unsaved_values'] = set()
         self.__dict__['_transient_values'] = set()
         # python2.6 doesnt have {} syntax for sets
-        self.__dict__['_immutable_values'] = set(['api_key', 'id'])
+        self.__dict__['_immutable_values'] = set(['_api_key', 'id'])
         self.__dict__['_retrieve_params'] = params
 
         self.__dict__['_parent'] = parent
         self.__dict__['_name'] = name
 
-        self.__dict__['api_key'] = api_key
+        self.__dict__['_api_key'] = api_key
 
         if easypost_id:
             self.id = easypost_id
@@ -436,9 +461,9 @@ class EasyPostObject(object):
         return instance
 
     def refresh_from(self, values, api_key):
-        self.api_key = api_key
+        self._api_key = api_key
 
-        for k, v in six.iteritems(values):
+        for k, v in sorted(six.iteritems(values)):
             if k == 'id' and self.id != v:
                 self.id = v
 
@@ -517,7 +542,7 @@ class Resource(EasyPostObject):
         return instance
 
     def refresh(self):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = self.instance_url()
         response, api_key = requestor.request('get', url, self._retrieve_params)
         self.refresh_from(response, api_key)
@@ -574,7 +599,7 @@ class CreateResource(Resource):
 class UpdateResource(Resource):
     def save(self):
         if self._unsaved_values:
-            requestor = Requestor(self.api_key)
+            requestor = Requestor(self._api_key)
             params = {}
             for k in self._unsaved_values:
                 params[k] = getattr(self, k)
@@ -590,7 +615,7 @@ class UpdateResource(Resource):
 
 class DeleteResource(Resource):
     def delete(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = self.instance_url()
         response, api_key = requestor.request('delete', url, params)
         self.refresh_from(response, api_key)
@@ -643,7 +668,7 @@ class Address(AllResource, CreateResource):
             return convert_to_easypost_object(response, api_key)
 
     def verify(self, carrier=None):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "verify")
         if carrier:
             url += "?carrier=%s" % carrier
@@ -662,7 +687,12 @@ class Address(AllResource, CreateResource):
 
 
 class ScanForm(AllResource, CreateResource):
-    pass
+    @classmethod
+    def create(cls, api_key=None, **params):
+        requestor = Requestor(api_key)
+        url = cls.class_url()
+        response, api_key = requestor.request('post', url, params)
+        return convert_to_easypost_object(response, api_key)
 
 
 class Insurance(AllResource, CreateResource):
@@ -690,21 +720,21 @@ class Shipment(AllResource, CreateResource):
         return response
 
     def get_rates(self):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "rates")
         response, api_key = requestor.request('get', url)
         self.refresh_from(response, api_key)
         return self
 
     def buy(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "buy")
         response, api_key = requestor.request('post', url, params)
         self.refresh_from(response, api_key)
         return self
 
     def refund(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "refund")
 
         response, api_key = requestor.request('get', url, params)
@@ -712,7 +742,7 @@ class Shipment(AllResource, CreateResource):
         return self
 
     def insure(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "insure")
 
         response, api_key = requestor.request('post', url, params)
@@ -720,7 +750,7 @@ class Shipment(AllResource, CreateResource):
         return self
 
     def label(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "label")
 
         response, api_key = requestor.request('get', url, params)
@@ -781,35 +811,35 @@ class Batch(AllResource, CreateResource):
         return convert_to_easypost_object(response, api_key)
 
     def buy(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "buy")
         response, api_key = requestor.request('post', url, params)
         self.refresh_from(response, api_key)
         return self
 
     def label(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "label")
         response, api_key = requestor.request('post', url, params)
         self.refresh_from(response, api_key)
         return self
 
     def remove_shipments(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "remove_shipments")
         response, api_key = requestor.request('post', url, params)
         self.refresh_from(response, api_key)
         return self
 
     def add_shipments(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "add_shipments")
         response, api_key = requestor.request('post', url, params)
         self.refresh_from(response, api_key)
         return self
 
     def create_scan_form(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "scan_form")
         response, api_key = requestor.request('post', url, params)
         self.refresh_from(response, api_key)
@@ -838,14 +868,14 @@ class Tracker(AllResource, CreateResource):
 
 class Pickup(AllResource, CreateResource):
     def buy(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "buy")
         response, api_key = requestor.request('post', url, params)
         self.refresh_from(response, api_key)
         return self
 
     def cancel(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "cancel")
         response, api_key = requestor.request('post', url, params)
         self.refresh_from(response, api_key)
@@ -853,8 +883,15 @@ class Pickup(AllResource, CreateResource):
 
 
 class Order(AllResource, CreateResource):
+    def get_rates(self):
+        requestor = Requestor(self._api_key)
+        url = "%s/%s" % (self.instance_url(), "rates")
+        response, api_key = requestor.request('get', url)
+        self.refresh_from(response, api_key)
+        return self
+
     def buy(self, **params):
-        requestor = Requestor(self.api_key)
+        requestor = Requestor(self._api_key)
         url = "%s/%s" % (self.instance_url(), "buy")
         response, api_key = requestor.request('post', url, params)
         self.refresh_from(response, api_key)
@@ -927,52 +964,19 @@ class User(CreateResource, UpdateResource, DeleteResource):
 
 class Report(AllResource, CreateResource):
 
-    REPORT_TYPES = {'shprep': 'shipment', 'plrep': 'payment_log', 'trkrep': 'tracker'}
-
     @classmethod
     def create(cls, api_key=None, **params):
         requestor = Requestor(api_key)
-        url = cls.class_url()
+        url = "%s/%s" % (cls.class_url(), params['type'])
         wrapped_params = {cls.class_name(): params}
-
-        if str(params['type']) in cls.REPORT_TYPES.values():
-            url += "/%s" % params['type']
-        else:
-            raise Exception("Undertermined Report Type")
 
         response, api_key = requestor.request('post', url, wrapped_params, False)
         return convert_to_easypost_object(response, api_key)
 
     @classmethod
-    def retrieve(cls, easypost_id="", api_key=None, **params):
-        try:
-            easypost_id = easypost_id['id']
-        except (KeyError, TypeError):
-            pass
-
-        url = cls.class_url()
-
-        obj_id = easypost_id.split("_")[0]
-
-        if obj_id in cls.REPORT_TYPES:
-            url += "/%s/%s" % (cls.REPORT_TYPES[obj_id], easypost_id)
-        else:
-            raise Exception("Undetermined Report Type")
-
-        requestor = Requestor(api_key)
-        response, api_key = requestor.request('get', url)
-        return convert_to_easypost_object(response, api_key)
-
-    @classmethod
     def all(cls, api_key=None, **params):
         requestor = Requestor(api_key)
-        url = cls.class_url()
-
-        if str(params['type']) in cls.REPORT_TYPES.values():
-            url += "/%s" % params['type']
-        else:
-            raise Exception("Undertemined Report Type")
-
+        url = "%s/%s" % (cls.class_url(), params['type'])
         response, api_key = requestor.request('get', url, params)
         return convert_to_easypost_object(response, api_key)
 
@@ -989,3 +993,12 @@ class Blob(AllResource, CreateResource):
         url = "%s/%s" % (cls.class_url(), easypost_id)
         response, api_key = requestor.request('get', url)
         return response["signed_url"]
+
+
+class Webhook(AllResource, CreateResource, DeleteResource):
+    def update(self, **params):
+        requestor = Requestor(self._api_key)
+        url = self.instance_url()
+        response, api_key = requestor.request('put', url, params)
+        self.refresh_from(response, api_key)
+        return self
