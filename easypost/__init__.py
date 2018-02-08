@@ -350,7 +350,7 @@ class Requestor(object):
                 Unexpected error communicating with EasyPost: {}
                 If this
                 problem persists please let us know at contact@easypost.com"
-                """.format(e.message)
+                """.format(str(e))
             )
         return http_body, http_status
 
